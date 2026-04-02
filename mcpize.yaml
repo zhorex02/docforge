@@ -1,0 +1,29 @@
+name: docforge
+description: "Professional Document Generator — Create invoices, receipts, quotes, proposals, SOWs, delivery notes, and credit notes as PDF from any AI assistant."
+version: 1
+runtime: python
+entry: mcp_server/server.py
+
+tools:
+  - generate_invoice
+  - generate_receipt
+  - generate_quote
+  - generate_proposal
+  - generate_sow
+  - generate_delivery_note
+  - generate_credit_note
+  - list_templates
+  - preview_document
+
+pricing:
+  free:
+    description: "3 documents per day. Invoice, receipt, quote only. EUR currency."
+    limits:
+      daily_calls: 3
+  pro:
+    price: 19
+    currency: usd
+    period: monthly
+    description: "100 documents per day. All 7 document types. Multi-currency. AI enhancement."
+    limits:
+      daily_calls: 100
