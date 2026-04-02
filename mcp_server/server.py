@@ -348,4 +348,11 @@ def generate_credit_note(
 
 
 if __name__ == "__main__":
-    mcp.run()
+    import os
+    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    if transport == "streamable-http":
+        mcp.run(transport="streamable-http", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    elif transport == "sse":
+        mcp.run(transport="sse", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+    else:
+        mcp.run()  # stdio default for local use
