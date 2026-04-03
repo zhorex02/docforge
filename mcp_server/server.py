@@ -59,23 +59,55 @@ def _cleanup_old_files():
         del _FILE_REGISTRY[name]
 
 
+def _upload_pdf(pdf_bytes: bytes, filename: str) -> str:
+    """Upload PDF to tmpfiles.org and return download URL."""
+    import httpx
+    try:
+        r = httpx.post(
+            "https://tmpfiles.org/api/v1/upload",
+            files={"file": (filename, pdf_bytes, "application/pdf")},
+            timeout=15.0,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if data.get("status") == "success":
+                # tmpfiles.org returns http://tmpfiles.org/ID/file
+                # Direct download needs /dl/ prefix: http://tmpfiles.org/dl/ID/file
+                url = data["data"]["url"]
+                return url.replace("tmpfiles.org/", "tmpfiles.org/dl/", 1)
+    except Exception:
+        pass
+    return ""
+
+
 def _build_response(doc_type: str, doc_id: str, filename: str, stored_name: str, size: int, pdf_bytes: bytes) -> str:
-    """Build a clean JSON response for the AI client."""
+    """Build a clean JSON response with a real download URL."""
     _cleanup_old_files()
 
-    import base64
-    b64_data = base64.b64encode(pdf_bytes).decode()
-    data_uri = f"data:application/pdf;base64,{b64_data}"
+    download_url = _upload_pdf(pdf_bytes, filename)
 
-    response = {
-        "success": True,
-        "document_type": doc_type,
-        "file_name": filename,
-        "mime_type": "application/pdf",
-        "size_bytes": size,
-        "download_link": data_uri,
-        "message": f"{doc_type.replace('_', ' ').title()} generated successfully ({size:,} bytes). Open the download_link to view the PDF.",
-    }
+    if download_url:
+        response = {
+            "success": True,
+            "document_type": doc_type,
+            "file_name": filename,
+            "mime_type": "application/pdf",
+            "size_bytes": size,
+            "download_url": download_url,
+            "message": f"Download your {doc_type.replace('_', ' ')}: {download_url}",
+        }
+    else:
+        # Fallback: base64 if upload fails
+        import base64
+        response = {
+            "success": True,
+            "document_type": doc_type,
+            "file_name": filename,
+            "mime_type": "application/pdf",
+            "size_bytes": size,
+            "download_url": f"data:application/pdf;base64,{base64.b64encode(pdf_bytes).decode()}",
+            "message": f"{doc_type.replace('_', ' ').title()} generated ({size:,} bytes). Use the download_url to open.",
+        }
     return json.dumps(response)
 
 
