@@ -59,26 +59,24 @@ def _cleanup_old_files():
         del _FILE_REGISTRY[name]
 
 
-def _build_response(doc_type: str, doc_id: str, filename: str, stored_name: str, size: int) -> str:
+def _build_response(doc_type: str, doc_id: str, filename: str, stored_name: str, size: int, pdf_bytes: bytes) -> str:
     """Build a clean JSON response for the AI client."""
     _cleanup_old_files()
 
-    # Build the download URL based on the gateway
-    gateway = os.getenv("MCPIZE_GATEWAY_URL", "https://docforge.mcpize.run")
-    download_url = f"{gateway}/files/{stored_name}"
+    import base64
+    b64_data = base64.b64encode(pdf_bytes).decode()
+    data_uri = f"data:application/pdf;base64,{b64_data}"
 
     response = {
         "success": True,
         "document_type": doc_type,
         "file_name": filename,
-        "file_id": doc_id,
-        "download_url": download_url,
         "mime_type": "application/pdf",
         "size_bytes": size,
-        "expires_in": "1 hour",
-        "message": f"{doc_type.replace('_', ' ').title()} generated successfully. Download: {download_url}",
+        "download_link": data_uri,
+        "message": f"{doc_type.replace('_', ' ').title()} generated successfully ({size:,} bytes). Open the download_link to view the PDF.",
     }
-    return json.dumps(response, indent=2)
+    return json.dumps(response)
 
 
 # ── Typed models for MCP tool parameters ──────────────────────────────────
@@ -120,10 +118,10 @@ def _items(items_list) -> list[dict]:
 # ── Helper to generate + store + respond ──────────────────────────────────
 
 def _generate_and_respond(doc_type: str, data: dict, filename: str) -> str:
-    """Generate PDF, store it, return clean JSON response."""
+    """Generate PDF, store it, return clean JSON response with data URI."""
     pdf_bytes = engine.generate(doc_type, data)
     doc_id, stored_name, size = _store_pdf(pdf_bytes, filename)
-    return _build_response(doc_type, doc_id, filename, stored_name, size)
+    return _build_response(doc_type, doc_id, filename, stored_name, size, pdf_bytes)
 
 
 # ── FREE TOOLS ────────────────────────────────────────────────────────────
