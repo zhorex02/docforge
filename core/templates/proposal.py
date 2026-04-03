@@ -23,7 +23,7 @@ def render_proposal(data: ProposalData) -> str:
 <div style="display:flex;gap:32px;margin-bottom:36px;">
 <div style="flex:1;background:#f9fafb;border-radius:8px;padding:16px 20px;">
 <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#9ca3af;margin-bottom:6px;">{L["prepared_by"]}</div>
-<strong>{co.name}</strong>{f'<br/><span style="color:#6b7280;font-size:13px;">{co.address}</span>' if co.address else ''}{f'<br/><span style="color:#6b7280;font-size:13px;">{co.email}</span>' if co.email else ''}
+{f'<img src="{co.logo_url}" style="max-height:60px;max-width:180px;margin-bottom:8px;" /><br/>' if co.logo_url else ''}<strong>{co.name}</strong>{f'<br/><span style="color:#6b7280;font-size:13px;">{co.address}</span>' if co.address else ''}{f'<br/><span style="color:#6b7280;font-size:13px;">{co.email}</span>' if co.email else ''}
 </div>
 <div style="flex:1;background:#f9fafb;border-radius:8px;padding:16px 20px;">
 <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:#9ca3af;margin-bottom:6px;">{L["prepared_for"]}</div>
