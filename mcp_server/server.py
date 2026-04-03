@@ -2,7 +2,11 @@
 
 import sys
 import os
-import base64
+import uuid
+import json
+import time
+import hashlib
+import threading
 
 # Add parent dir to path so core/ is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -15,8 +19,69 @@ mcp = FastMCP("DocForge")
 engine = DocForgeEngine()
 
 
+# ── File storage for generated PDFs ───────────────────────────────────────
+
+_STORAGE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".generated")
+os.makedirs(_STORAGE_DIR, exist_ok=True)
+
+# Track files for cleanup (remove after 1 hour)
+_FILE_REGISTRY: dict[str, float] = {}
+_CLEANUP_INTERVAL = 3600  # 1 hour
+
+
+def _store_pdf(pdf_bytes: bytes, filename: str) -> str:
+    """Store PDF to disk, return the file ID."""
+    file_id = hashlib.sha256(f"{filename}{time.time()}{uuid.uuid4()}".encode()).hexdigest()[:16]
+    safe_name = filename.replace(" ", "_").replace("/", "-")
+    stored_name = f"{file_id}_{safe_name}"
+    filepath = os.path.join(_STORAGE_DIR, stored_name)
+
+    with open(filepath, "wb") as f:
+        f.write(pdf_bytes)
+
+    _FILE_REGISTRY[stored_name] = time.time()
+    return file_id, stored_name, len(pdf_bytes)
+
+
+def _cleanup_old_files():
+    """Remove files older than 1 hour."""
+    now = time.time()
+    to_remove = []
+    for name, created_at in _FILE_REGISTRY.items():
+        if now - created_at > _CLEANUP_INTERVAL:
+            filepath = os.path.join(_STORAGE_DIR, name)
+            try:
+                os.remove(filepath)
+            except OSError:
+                pass
+            to_remove.append(name)
+    for name in to_remove:
+        del _FILE_REGISTRY[name]
+
+
+def _build_response(doc_type: str, doc_id: str, filename: str, stored_name: str, size: int) -> str:
+    """Build a clean JSON response for the AI client."""
+    _cleanup_old_files()
+
+    # Build the download URL based on the gateway
+    gateway = os.getenv("MCPIZE_GATEWAY_URL", "https://docforge.mcpize.run")
+    download_url = f"{gateway}/files/{stored_name}"
+
+    response = {
+        "success": True,
+        "document_type": doc_type,
+        "file_name": filename,
+        "file_id": doc_id,
+        "download_url": download_url,
+        "mime_type": "application/pdf",
+        "size_bytes": size,
+        "expires_in": "1 hour",
+        "message": f"{doc_type.replace('_', ' ').title()} generated successfully. Download: {download_url}",
+    }
+    return json.dumps(response, indent=2)
+
+
 # ── Typed models for MCP tool parameters ──────────────────────────────────
-# These give AI clients the exact schema they need.
 
 class InvoiceItem(BaseModel):
     """A single line item on an invoice, receipt, quote, or credit note."""
@@ -38,6 +103,27 @@ class Milestone(BaseModel):
     description: str = Field("", description="Optional details about the milestone")
     due_date: str = Field("", description="Due date in YYYY-MM-DD format")
     amount: float = Field(0.0, description="Payment amount for this milestone")
+
+
+# ── Safe value helpers (Field defaults may not resolve in direct calls) ────
+
+def _s(val, default="") -> str:
+    return val if isinstance(val, str) else default
+
+def _f(val, default=0.0) -> float:
+    return float(val) if isinstance(val, (int, float)) else default
+
+def _items(items_list) -> list[dict]:
+    return [i.model_dump() if hasattr(i, "model_dump") else i for i in items_list]
+
+
+# ── Helper to generate + store + respond ──────────────────────────────────
+
+def _generate_and_respond(doc_type: str, data: dict, filename: str) -> str:
+    """Generate PDF, store it, return clean JSON response."""
+    pdf_bytes = engine.generate(doc_type, data)
+    doc_id, stored_name, size = _store_pdf(pdf_bytes, filename)
+    return _build_response(doc_type, doc_id, filename, stored_name, size)
 
 
 # ── FREE TOOLS ────────────────────────────────────────────────────────────
@@ -64,20 +150,19 @@ def generate_invoice(
     bank_details: str = Field("", description="Bank details for payment (IBAN, BIC, bank name)"),
     language: str = Field("en", description="Document language: 'en' for English, 'es' for Spanish"),
 ) -> str:
-    """Generate a professional invoice as PDF. Returns the PDF encoded in base64.
+    """Generate a professional invoice as PDF. Returns a download URL for the PDF file.
 
     Example items: [{"description": "Web Development", "quantity": 10, "unit_price": 150.00}]
     """
     data = {
-        "company": {"name": company_name, "address": company_address, "tax_id": company_tax_id, "email": company_email},
-        "client": {"name": client_name, "address": client_address, "tax_id": client_tax_id, "email": client_email},
-        "invoice_number": invoice_number, "invoice_date": invoice_date, "due_date": due_date,
-        "items": [i.model_dump() for i in items], "currency": currency, "tax_rate": tax_rate,
-        "discount_percent": discount_percent, "notes": notes, "payment_terms": payment_terms,
-        "bank_details": bank_details, "language": language,
+        "company": {"name": company_name, "address": company_address, "tax_id": _s(company_tax_id), "email": _s(company_email)},
+        "client": {"name": client_name, "address": client_address, "tax_id": _s(client_tax_id), "email": _s(client_email)},
+        "invoice_number": invoice_number, "invoice_date": invoice_date, "due_date": _s(due_date),
+        "items": _items(items), "currency": _s(currency, "EUR"), "tax_rate": _f(tax_rate, 21.0),
+        "discount_percent": _f(discount_percent), "notes": _s(notes),
+        "payment_terms": _s(payment_terms), "bank_details": _s(bank_details), "language": _s(language, "en"),
     }
-    pdf_bytes = engine.generate("invoice", data)
-    return f"Invoice PDF generated ({len(pdf_bytes):,} bytes). Base64:\n{base64.b64encode(pdf_bytes).decode()}"
+    return _generate_and_respond("invoice", data, f"invoice-{invoice_number}.pdf")
 
 
 @mcp.tool()
@@ -95,20 +180,19 @@ def generate_receipt(
     notes: str = Field("", description="Additional notes"),
     language: str = Field("en", description="'en' or 'es'"),
 ) -> str:
-    """Generate a payment receipt PDF marked as PAID. Returns base64-encoded PDF.
+    """Generate a payment receipt PDF marked as PAID. Returns a download URL.
 
     Example items: [{"description": "Consulting Services", "quantity": 1, "unit_price": 500.00}]
     """
     data = {
-        "company": {"name": company_name, "address": company_address},
-        "client": {"name": client_name, "address": client_address},
+        "company": {"name": company_name, "address": _s(company_address)},
+        "client": {"name": client_name, "address": _s(client_address)},
         "receipt_number": receipt_number, "receipt_date": receipt_date,
-        "payment_method": payment_method,
-        "items": [i.model_dump() for i in items],
-        "currency": currency, "tax_rate": tax_rate, "notes": notes, "language": language,
+        "payment_method": _s(payment_method, "Bank Transfer"),
+        "items": _items(items), "currency": _s(currency, "EUR"),
+        "tax_rate": _f(tax_rate, 21.0), "notes": _s(notes), "language": _s(language, "en"),
     }
-    pdf_bytes = engine.generate("receipt", data)
-    return f"Receipt PDF generated ({len(pdf_bytes):,} bytes). Base64:\n{base64.b64encode(pdf_bytes).decode()}"
+    return _generate_and_respond("receipt", data, f"receipt-{receipt_number}.pdf")
 
 
 @mcp.tool()
@@ -127,20 +211,18 @@ def generate_quote(
     notes: str = Field("", description="Additional notes"),
     language: str = Field("en", description="'en' or 'es'"),
 ) -> str:
-    """Generate a quote/estimate PDF with validity date. Returns base64-encoded PDF.
+    """Generate a quote/estimate PDF with validity date. Returns a download URL.
 
     Example items: [{"description": "Website Redesign", "quantity": 1, "unit_price": 5000.00}]
     """
     data = {
-        "company": {"name": company_name, "address": company_address},
-        "client": {"name": client_name, "address": client_address},
+        "company": {"name": company_name, "address": _s(company_address)},
+        "client": {"name": client_name, "address": _s(client_address)},
         "quote_number": quote_number, "quote_date": quote_date, "valid_until": valid_until,
-        "items": [i.model_dump() for i in items],
-        "currency": currency, "tax_rate": tax_rate,
-        "discount_percent": discount_percent, "notes": notes, "language": language,
+        "items": _items(items), "currency": _s(currency, "EUR"), "tax_rate": _f(tax_rate, 21.0),
+        "discount_percent": _f(discount_percent), "notes": _s(notes), "language": _s(language, "en"),
     }
-    pdf_bytes = engine.generate("quote", data)
-    return f"Quote PDF generated ({len(pdf_bytes):,} bytes). Base64:\n{base64.b64encode(pdf_bytes).decode()}"
+    return _generate_and_respond("quote", data, f"quote-{quote_number}.pdf")
 
 
 @mcp.tool()
@@ -165,12 +247,12 @@ def list_templates() -> str:
 
 5. **Statement of Work** (SOW) — generate_sow
    Required: company_name, client_name, project_title, sow_date, description, deliverables
-   Deliverables format: ["Deliverable 1", "Deliverable 2"]
-   Milestones format: [{"name": "Phase 1", "due_date": "2026-05-01", "amount": 5000}]
+   Deliverables: ["Deliverable 1", "Deliverable 2"]
+   Milestones: [{"name": "Phase 1", "due_date": "2026-05-01", "amount": 5000}]
 
 6. **Delivery Note** (Albarán) — generate_delivery_note
    Required: company_name, client_name, delivery_number, delivery_date, items
-   Items format: [{"description": "Item", "quantity": 2, "unit": "boxes"}]
+   Items: [{"description": "Item", "quantity": 2, "unit": "boxes"}]
 
 7. **Credit Note** (Nota de Crédito) — generate_credit_note
    Required: company_name, client_name, credit_note_number, credit_note_date, original_invoice, reason, items
@@ -200,16 +282,16 @@ def generate_proposal(
     conditions: str = Field("", description="Terms and conditions text"),
     language: str = Field("en", description="'en' or 'es'"),
 ) -> str:
-    """Generate a project proposal PDF with executive summary, scope, timeline, and pricing. Returns base64-encoded PDF. PRO feature."""
+    """Generate a project proposal PDF. Returns a download URL. PRO feature."""
     data = {
-        "company": {"name": company_name, "address": company_address},
-        "client": {"name": client_name, "address": client_address},
+        "company": {"name": company_name, "address": _s(company_address)},
+        "client": {"name": client_name, "address": _s(client_address)},
         "project_title": project_title, "proposal_date": proposal_date,
         "summary": summary, "scope": scope, "timeline": timeline,
-        "investment": investment, "conditions": conditions, "language": language,
+        "investment": investment, "conditions": _s(conditions), "language": _s(language, "en"),
     }
-    pdf_bytes = engine.generate("proposal", data)
-    return f"Proposal PDF generated ({len(pdf_bytes):,} bytes). Base64:\n{base64.b64encode(pdf_bytes).decode()}"
+    safe_title = project_title.replace(" ", "-")[:30]
+    return _generate_and_respond("proposal", data, f"proposal-{safe_title}.pdf")
 
 
 @mcp.tool()
@@ -227,21 +309,21 @@ def generate_sow(
     currency: str = Field("EUR", description="Currency code"),
     language: str = Field("en", description="'en' or 'es'"),
 ) -> str:
-    """Generate a Statement of Work PDF with deliverables and milestones. Returns base64-encoded PDF. PRO feature.
+    """Generate a Statement of Work PDF with deliverables and milestones. Returns a download URL. PRO feature.
 
     Example milestones: [{"name": "Phase 1", "due_date": "2026-05-01", "amount": 5000}]
     """
     data = {
-        "company": {"name": company_name, "address": company_address},
-        "client": {"name": client_name, "address": client_address},
+        "company": {"name": company_name, "address": _s(company_address)},
+        "client": {"name": client_name, "address": _s(client_address)},
         "project_title": project_title, "sow_date": sow_date,
         "description": description, "deliverables": deliverables,
-        "milestones": [m.model_dump() for m in milestones],
-        "acceptance_criteria": acceptance_criteria,
-        "currency": currency, "language": language,
+        "milestones": [m.model_dump() if hasattr(m, "model_dump") else m for m in (milestones or [])],
+        "acceptance_criteria": _s(acceptance_criteria),
+        "currency": _s(currency, "EUR"), "language": _s(language, "en"),
     }
-    pdf_bytes = engine.generate("sow", data)
-    return f"SOW PDF generated ({len(pdf_bytes):,} bytes). Base64:\n{base64.b64encode(pdf_bytes).decode()}"
+    safe_title = project_title.replace(" ", "-")[:30]
+    return _generate_and_respond("sow", data, f"sow-{safe_title}.pdf")
 
 
 @mcp.tool()
@@ -257,20 +339,18 @@ def generate_delivery_note(
     notes: str = Field("", description="Additional notes"),
     language: str = Field("en", description="'en' or 'es'"),
 ) -> str:
-    """Generate a delivery note/packing slip PDF with signature field. Returns base64-encoded PDF. PRO feature.
+    """Generate a delivery note/packing slip PDF with signature field. Returns a download URL. PRO feature.
 
     Example items: [{"description": "Server Equipment", "quantity": 2, "unit": "pcs"}]
     """
     data = {
-        "company": {"name": company_name, "address": company_address},
-        "client": {"name": client_name, "address": client_address},
+        "company": {"name": company_name, "address": _s(company_address)},
+        "client": {"name": client_name, "address": _s(client_address)},
         "delivery_number": delivery_number, "delivery_date": delivery_date,
-        "invoice_reference": invoice_reference,
-        "items": [i.model_dump() for i in items],
-        "notes": notes, "language": language,
+        "invoice_reference": _s(invoice_reference),
+        "items": _items(items), "notes": _s(notes), "language": _s(language, "en"),
     }
-    pdf_bytes = engine.generate("delivery_note", data)
-    return f"Delivery Note PDF generated ({len(pdf_bytes):,} bytes). Base64:\n{base64.b64encode(pdf_bytes).decode()}"
+    return _generate_and_respond("delivery_note", data, f"delivery-note-{delivery_number}.pdf")
 
 
 @mcp.tool()
@@ -288,28 +368,57 @@ def generate_credit_note(
     client_address: str = Field("", description="Client address"),
     language: str = Field("en", description="'en' or 'es'"),
 ) -> str:
-    """Generate a credit note PDF referencing an original invoice. Shows negative amounts. Returns base64-encoded PDF. PRO feature.
+    """Generate a credit note PDF referencing an original invoice. Returns a download URL. PRO feature.
 
     Example items: [{"description": "Overcharged hours", "quantity": 5, "unit_price": 100.00}]
     """
     data = {
-        "company": {"name": company_name, "address": company_address},
-        "client": {"name": client_name, "address": client_address},
+        "company": {"name": company_name, "address": _s(company_address)},
+        "client": {"name": client_name, "address": _s(client_address)},
         "credit_note_number": credit_note_number, "credit_note_date": credit_note_date,
         "original_invoice": original_invoice, "reason": reason,
-        "items": [i.model_dump() for i in items],
-        "currency": currency, "tax_rate": tax_rate, "language": language,
+        "items": _items(items), "currency": _s(currency, "EUR"),
+        "tax_rate": _f(tax_rate, 21.0), "language": _s(language, "en"),
     }
-    pdf_bytes = engine.generate("credit_note", data)
-    return f"Credit Note PDF generated ({len(pdf_bytes):,} bytes). Base64:\n{base64.b64encode(pdf_bytes).decode()}"
+    return _generate_and_respond("credit_note", data, f"credit-note-{credit_note_number}.pdf")
+
+
+# ── File serving (for download URLs) ─────────────────────────────────────
+
+@mcp.custom_route("/files/{filename}", methods=["GET"])
+async def serve_file(request):
+    """Serve generated PDF files for download."""
+    from starlette.responses import Response as StarletteResponse
+
+    filename = request.path_params.get("filename", "")
+    filepath = os.path.join(_STORAGE_DIR, filename)
+
+    if not os.path.exists(filepath) or ".." in filename:
+        return StarletteResponse(
+            content=json.dumps({"error": "file_not_found", "message": "File not found or expired."}),
+            status_code=404,
+            media_type="application/json",
+        )
+
+    with open(filepath, "rb") as f:
+        pdf_data = f.read()
+
+    return StarletteResponse(
+        content=pdf_data,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename.split("_", 1)[-1] if "_" in filename else filename}"',
+            "Content-Length": str(len(pdf_data)),
+        },
+    )
 
 
 if __name__ == "__main__":
-    import os
-    transport = os.getenv("MCP_TRANSPORT", "stdio")
+    import os as _os
+    transport = _os.getenv("MCP_TRANSPORT", "stdio")
     if transport == "streamable-http":
-        mcp.run(transport="streamable-http", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+        mcp.run(transport="streamable-http", host="0.0.0.0", port=int(_os.getenv("PORT", "8080")))
     elif transport == "sse":
-        mcp.run(transport="sse", host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+        mcp.run(transport="sse", host="0.0.0.0", port=int(_os.getenv("PORT", "8080")))
     else:
         mcp.run()
